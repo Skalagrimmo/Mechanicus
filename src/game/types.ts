@@ -198,3 +198,38 @@ export interface TrackMetadata {
   duration: string;
   role: 'ambient' | 'combat' | 'boss' | 'chase';
 }
+
+export type SfxType = 
+  | 'swing' 
+  | 'heavy_hit' 
+  | 'parry' 
+  | 'dash' 
+  | 'explosion' 
+  | 'shock' 
+  | 'freeze' 
+  | 'laser' 
+  | 'pickup' 
+  | 'terminal' 
+  | 'player_hurt'
+  | 'boss_roar';
+
+export type GameEvent =
+  | { type: 'sfx'; sound: SfxType }
+  | { type: 'track'; trackKey: AudioTrackKey }
+  | { type: 'shake'; amount: number }
+  | { type: 'hitstop'; duration: number }
+  | { type: 'particle'; x: number; y: number; color: string; count?: number; speed?: number; size?: number }
+  | { type: 'floatText'; x: number; y: number; text: string; color?: string }
+  | { type: 'sectorChange'; sectorId: number; nameUk: string }
+  | { type: 'stateChange'; newState: GameState }
+  | { type: 'objectiveChange'; textUk: string };
+
+export type GameEventListener = (event: GameEvent) => void;
+
+export type PlayerActionCommand = 'light' | 'heavy' | 'dash' | 'parry' | 'emp' | 'interact';
+
+export interface PlayerInputIntent {
+  moveX: number;
+  moveY: number;
+  actions: PlayerActionCommand[];
+}

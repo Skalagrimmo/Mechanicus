@@ -1,17 +1,15 @@
-// Service Worker for offline PWA gameplay
-const CACHE_NAME = 'mechanicus-v1';
-const ASSETS_TO_CACHE = [
+// Service Worker for MECHANICUS PWA offline functionality
+const CACHE_NAME = 'mechanicus-v2';
+const CORE_STATIC_ASSETS = [
   '/',
   '/index.html',
-  '/manifest.webmanifest',
-  '/src/main.tsx',
-  '/src/index.css'
+  '/manifest.webmanifest'
 ];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
     caches.open(CACHE_NAME).then((cache) => {
-      return cache.addAll(ASSETS_TO_CACHE);
+      return cache.addAll(CORE_STATIC_ASSETS);
     })
   );
   self.skipWaiting();
@@ -30,19 +28,33 @@ self.addEventListener('activate', (event) => {
 
 self.addEventListener('fetch', (event) => {
   if (event.request.method !== 'GET') return;
+  const url = new URL(event.request.url);
+
+  // Stale-while-revalidate for app assets, cache fallback for navigation
   event.respondWith(
     caches.match(event.request).then((cachedResponse) => {
-      if (cachedResponse) {
-        return cachedResponse;
-      }
-      return fetch(event.request).then((networkResponse) => {
-        return networkResponse;
-      }).catch(() => {
-        // Fallback for offline navigation
-        if (event.request.mode === 'navigate') {
-          return caches.match('/');
-        }
-      });
+      const fetchPromise = fetch(event.request)
+        .then((networkResponse) => {
+          if (networkResponse && networkResponse.status === 200) {
+            const responseToCache = networkResponse.clone();
+            caches.open(CACHE_NAME).then((cache) => {
+              // Cache static assets and fonts
+              if (url.pathname.startsWith('/assets/') || url.hostname.includes('fonts.')) {
+                cache.put(event.request, responseToCache);
+              }
+            });
+          }
+          return networkResponse;
+        })
+        .catch(() => {
+          // If offline and requesting navigation, fallback to root
+          if (event.request.mode === 'navigate') {
+            return caches.match('/');
+          }
+          return cachedResponse;
+        });
+
+      return cachedResponse || fetchPromise;
     })
   );
 });
