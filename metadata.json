@@ -1,0 +1,6 @@
+{
+  "name": "MECHANICUS: 16-Bit Systemic Adventure",
+  "description": "Олдскульна 16-бітна системна екшн-адвенчура з елементами RPG, інтерактивним світом, комбо-боївкою, звуковим саундтреком та оптимізацією під Android/PWA.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

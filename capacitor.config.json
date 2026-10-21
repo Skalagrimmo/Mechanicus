@@ -1,0 +1,18 @@
+{
+  "appId": "com.mechanicus.systemic",
+  "appName": "Mechanicus",
+  "webDir": "dist",
+  "bundledWebRuntime": false,
+  "android": {
+    "backgroundColor": "#080a0f",
+    "allowMixedContent": true,
+    "captureInput": true,
+    "webContentsDebuggingEnabled": true
+  },
+  "plugins": {
+    "SplashScreen": {
+      "launchShowDuration": 1500,
+      "backgroundColor": "#080a0f"
+    }
+  }
+}
