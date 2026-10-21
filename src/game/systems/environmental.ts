@@ -44,7 +44,8 @@ export class EnvironmentalSystem {
     map: SectorMap,
     props: WorldProp[],
     enemies: EnemyEntity[],
-    events: GameEvent[]
+    events: GameEvent[],
+    onDamageEnemy?: (enemy: EnemyEntity, damage: number, element: ElementType) => void
   ): EnvironmentalHazard {
     const newHazard: EnvironmentalHazard = {
       id: Math.random(),
@@ -64,7 +65,7 @@ export class EnvironmentalSystem {
     this.resolvePropReactions(newHazard, props, events);
 
     // 4. Apply immediate impact to enemies in radius
-    this.applyInstantEnemyEffects(newHazard, enemies, events);
+    this.applyInstantEnemyEffects(newHazard, enemies, events, onDamageEnemy);
 
     this.hazards.push(newHazard);
     return newHazard;
@@ -238,7 +239,15 @@ export class EnvironmentalSystem {
   /**
    * Applies immediate elemental statuses to enemies when hazard appears
    */
-  private applyInstantEnemyEffects(hazard: EnvironmentalHazard, enemies: EnemyEntity[], events: GameEvent[]): void {
+  /**
+   * Applies immediate elemental statuses to enemies when hazard appears
+   */
+  private applyInstantEnemyEffects(
+    hazard: EnvironmentalHazard,
+    enemies: EnemyEntity[],
+    events: GameEvent[],
+    onDamageEnemy?: (enemy: EnemyEntity, damage: number, element: ElementType) => void
+  ): void {
     for (const enemy of enemies) {
       if (enemy.state === 'ko') continue;
       const dist = Math.hypot(enemy.pos.x - hazard.pos.x, enemy.pos.y - hazard.pos.y);
@@ -246,10 +255,17 @@ export class EnvironmentalSystem {
         if (hazard.element === 'electricity') {
           const mult = getElementalDamageMultiplier('electricity', enemy.elementalStatus?.type);
           const dmg = Math.round(20 * mult);
-          enemy.hp -= dmg;
-          enemy.state = 'stunned';
-          enemy.stateTimer = 1.8;
-          enemy.elementalStatus = { type: 'electricity', duration: 3.0 };
+          if (onDamageEnemy) {
+            onDamageEnemy(enemy, dmg, 'electricity');
+          } else {
+            enemy.hp = Math.max(0, enemy.hp - dmg);
+            if (enemy.hp <= 0) enemy.state = 'ko';
+          }
+          if (enemy.state !== 'ko') {
+            enemy.state = 'stunned';
+            enemy.stateTimer = 1.8;
+            enemy.elementalStatus = { type: 'electricity', duration: 3.0 };
+          }
           events.push({
             type: 'floatText',
             x: enemy.pos.x,
@@ -270,8 +286,15 @@ export class EnvironmentalSystem {
           });
         } else if (hazard.element === 'fire') {
           const dmg = 25;
-          enemy.hp -= dmg;
-          enemy.elementalStatus = { type: 'fire', duration: 3.5 };
+          if (onDamageEnemy) {
+            onDamageEnemy(enemy, dmg, 'fire');
+          } else {
+            enemy.hp = Math.max(0, enemy.hp - dmg);
+            if (enemy.hp <= 0) enemy.state = 'ko';
+          }
+          if (enemy.state !== 'ko') {
+            enemy.elementalStatus = { type: 'fire', duration: 3.5 };
+          }
           events.push({
             type: 'floatText',
             x: enemy.pos.x,
@@ -291,7 +314,9 @@ export class EnvironmentalSystem {
     dt: number,
     player: PlayerEntity,
     enemies: EnemyEntity[],
-    events: GameEvent[]
+    events: GameEvent[],
+    onDamagePlayer?: (damage: number, sourceName: string, element?: ElementType) => void,
+    onDamageEnemy?: (enemy: EnemyEntity, damage: number, element: ElementType) => void
   ): void {
     // 1. Decrement and remove expired hazards
     for (let i = this.hazards.length - 1; i >= 0; i--) {
@@ -311,27 +336,37 @@ export class EnvironmentalSystem {
         const playerDist = Math.hypot(player.pos.x - h.pos.x, player.pos.y - h.pos.y);
         if (playerDist <= h.radius && player.invulnTimer <= 0) {
           if (h.element === 'fire') {
-            player.stats.hp -= 6;
-            player.invulnTimer = 0.35;
-            events.push({ type: 'sfx', sound: 'player_hurt' });
-            events.push({
-              type: 'floatText',
-              x: player.pos.x,
-              y: player.pos.y - 12,
-              text: '-6 ВОГОНЬ',
-              color: '#f97316'
-            });
+            const dmg = 6;
+            if (onDamagePlayer) {
+              onDamagePlayer(dmg, 'ВОГОНЬ', 'fire');
+            } else {
+              player.stats.hp = Math.max(0, player.stats.hp - dmg);
+              player.invulnTimer = 0.35;
+              events.push({ type: 'sfx', sound: 'player_hurt' });
+              events.push({
+                type: 'floatText',
+                x: player.pos.x,
+                y: player.pos.y - 12,
+                text: '-6 ВОГОНЬ',
+                color: '#f97316'
+              });
+            }
           } else if (h.element === 'electricity') {
-            player.stats.hp -= 8;
-            player.invulnTimer = 0.4;
-            events.push({ type: 'sfx', sound: 'shock' });
-            events.push({
-              type: 'floatText',
-              x: player.pos.x,
-              y: player.pos.y - 12,
-              text: '-8 СТРУМ',
-              color: '#38bdf8'
-            });
+            const dmg = 8;
+            if (onDamagePlayer) {
+              onDamagePlayer(dmg, 'СТРУМ', 'electricity');
+            } else {
+              player.stats.hp = Math.max(0, player.stats.hp - dmg);
+              player.invulnTimer = 0.4;
+              events.push({ type: 'sfx', sound: 'shock' });
+              events.push({
+                type: 'floatText',
+                x: player.pos.x,
+                y: player.pos.y - 12,
+                text: '-8 СТРУМ',
+                color: '#38bdf8'
+              });
+            }
           }
         }
 
@@ -341,25 +376,35 @@ export class EnvironmentalSystem {
           const dist = Math.hypot(enemy.pos.x - h.pos.x, enemy.pos.y - h.pos.y);
           if (dist <= h.radius) {
             if (h.element === 'fire') {
-              enemy.hp -= 8;
-              enemy.invulnTimer = 0.2;
-              events.push({
-                type: 'floatText',
-                x: enemy.pos.x,
-                y: enemy.pos.y - 10,
-                text: '-8 ВОГОНЬ',
-                color: '#f97316'
-              });
+              const dmg = 8;
+              if (onDamageEnemy) {
+                onDamageEnemy(enemy, dmg, 'fire');
+              } else {
+                enemy.hp = Math.max(0, enemy.hp - dmg);
+                if (enemy.hp <= 0) enemy.state = 'ko';
+                events.push({
+                  type: 'floatText',
+                  x: enemy.pos.x,
+                  y: enemy.pos.y - 10,
+                  text: '-8 ВОГОНЬ',
+                  color: '#f97316'
+                });
+              }
             } else if (h.element === 'electricity') {
-              enemy.hp -= 10;
-              enemy.invulnTimer = 0.2;
-              events.push({
-                type: 'floatText',
-                x: enemy.pos.x,
-                y: enemy.pos.y - 10,
-                text: '-10 СТРУМ',
-                color: '#38bdf8'
-              });
+              const dmg = 10;
+              if (onDamageEnemy) {
+                onDamageEnemy(enemy, dmg, 'electricity');
+              } else {
+                enemy.hp = Math.max(0, enemy.hp - dmg);
+                if (enemy.hp <= 0) enemy.state = 'ko';
+                events.push({
+                  type: 'floatText',
+                  x: enemy.pos.x,
+                  y: enemy.pos.y - 10,
+                  text: '-10 СТРУМ',
+                  color: '#38bdf8'
+                });
+              }
             }
           }
         }

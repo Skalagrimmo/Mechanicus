@@ -2,18 +2,17 @@
  * 16-Bit Systemic Game Engine - Enemy AI & State Machine System
  * Decoupled AI behaviors for swarm drones, ranged sentries, heavy enforcers,
  * and the Warden boss, with elemental reactions and attack telegraphs.
+ * All velocities are in pixels per second, and positions integrate velocity * dt.
  */
 
 import { EnemyEntity, PlayerEntity, Projectile, GameEvent } from '../types';
-import { calculateIncomingDamage } from './combat';
 
 export interface EnemyUpdateContext {
   dt: number;
   player: PlayerEntity;
   projectiles: Projectile[];
   events: GameEvent[];
-  onPlayerHit: (damage: number) => void;
-  onBossDefeated: () => void;
+  applyDamageToPlayer: (rawDamage: number, sourceName: string, ignoreParry?: boolean) => boolean;
 }
 
 export class EnemyAISystem {
@@ -21,7 +20,7 @@ export class EnemyAISystem {
    * Updates all active enemies according to their archetypes and state machines
    */
   public update(enemies: EnemyEntity[], ctx: EnemyUpdateContext): void {
-    const { dt, player, projectiles, events, onPlayerHit, onBossDefeated } = ctx;
+    const { dt, player, projectiles, events, applyDamageToPlayer } = ctx;
 
     for (const enemy of enemies) {
       if (enemy.state === 'ko') continue;
@@ -37,13 +36,14 @@ export class EnemyAISystem {
         }
       }
 
-      // Knockback damping (physics based on dt)
-      enemy.pos.x += enemy.vel.x * 60 * dt;
-      enemy.pos.y += enemy.vel.y * 60 * dt;
-      enemy.vel.x *= Math.pow(0.15, dt);
-      enemy.vel.y *= Math.pow(0.15, dt);
+      // Knockback / velocity integration with smooth exponential friction
+      enemy.pos.x += enemy.vel.x * dt;
+      enemy.pos.y += enemy.vel.y * dt;
+      const friction = Math.exp(-6.0 * dt);
+      enemy.vel.x *= friction;
+      enemy.vel.y *= friction;
 
-      // If stunned (e.g. from parry, EMP, or freeze)
+      // Stunned check (from parry, EMP, freeze, or shock)
       if (enemy.state === 'stunned') {
         enemy.stateTimer -= dt;
         if (enemy.stateTimer <= 0) {
@@ -65,34 +65,32 @@ export class EnemyAISystem {
 
       // Speed modifier (frozen enemies move at 40% speed)
       const speedMod = enemy.elementalStatus?.type === 'ice' ? 0.4 : 1.0;
-      const effectiveSpeed = enemy.speed * 60 * speedMod * dt; // Units: pixels per second
+      // Base speed scaled to pixels per second (e.g. speed 1.1 -> ~72 px/sec)
+      const speedPxPerSec = (enemy.speed * 65) * speedMod;
 
-      // 1. Drone Swarmer Archetype
+      // 1. Drone Swarmer Archetype (aggressive chaser)
       if (enemy.type === 'drone_swarmer') {
         if (distToPlayer < 200) {
-          enemy.pos.x += (dx / distToPlayer) * effectiveSpeed;
-          enemy.pos.y += (dy / distToPlayer) * effectiveSpeed;
+          enemy.pos.x += (dx / distToPlayer) * speedPxPerSec * dt;
+          enemy.pos.y += (dy / distToPlayer) * speedPxPerSec * dt;
 
-          // Melee attack range
-          if (distToPlayer < 14 && player.invulnTimer <= 0) {
-            const inc = calculateIncomingDamage(enemy.damage, player.isParrying, false, player.stats.equippedImplants);
-            if (inc.parrySuccess) {
-              events.push({ type: 'sfx', sound: 'parry' });
-              events.push({ type: 'shake', amount: 3 });
-              events.push({ type: 'floatText', x: player.pos.x, y: player.pos.y - 14, text: 'ПАРИР!', color: '#38bdf8' });
+          // Melee attack range check
+          if (distToPlayer < 14) {
+            const isParryingActive = player.isParrying && player.parryTimer > 0;
+            if (isParryingActive) {
+              // Perfect parry deflects enemy and stuns it!
               enemy.state = 'stunned';
               enemy.stateTimer = 1.2;
-            } else if (!inc.absorbed) {
-              onPlayerHit(inc.finalDamage);
-              events.push({ type: 'sfx', sound: 'player_hurt' });
-              events.push({ type: 'shake', amount: 4 });
-              events.push({ type: 'floatText', x: player.pos.x, y: player.pos.y - 12, text: `-${inc.finalDamage}`, color: '#ef4444' });
+              events.push({ type: 'sfx', sound: 'parry' });
+              applyDamageToPlayer(enemy.damage, 'ДРОН'); // Will trigger parry inside applyDamageToPlayer
+            } else if (player.invulnTimer <= 0) {
+              applyDamageToPlayer(enemy.damage, 'ДРОН');
             }
           }
         }
       }
 
-      // 2. Sentry Ranged Archetype
+      // 2. Sentry Ranged Archetype (kiter with laser telegraph)
       else if (enemy.type === 'sentry_ranged') {
         if (distToPlayer < 220) {
           if (enemy.state === 'idle') {
@@ -103,15 +101,16 @@ export class EnemyAISystem {
             enemy.windupTimer -= dt;
             enemy.telegraphPos = { x: player.pos.x, y: player.pos.y };
             if (enemy.windupTimer <= 0) {
-              // Fire laser projectile
+              // Fire laser projectile with persistent speed in px/s
               enemy.state = 'attack';
               enemy.stateTimer = 0.5;
               events.push({ type: 'sfx', sound: 'laser' });
               const projAngle = Math.atan2(dy, dx);
+              const laserSpeed = 220; // px/sec
               projectiles.push({
                 id: Math.random(),
                 pos: { x: enemy.pos.x, y: enemy.pos.y },
-                vel: { x: Math.cos(projAngle) * 220 * dt, y: Math.sin(projAngle) * 220 * dt },
+                vel: { x: Math.cos(projAngle) * laserSpeed, y: Math.sin(projAngle) * laserSpeed },
                 radius: 3,
                 damage: enemy.damage,
                 element: 'electricity',
@@ -126,7 +125,7 @@ export class EnemyAISystem {
         }
       }
 
-      // 3. Enforcer Heavy Archetype
+      // 3. Enforcer Heavy Archetype (heavy charger with shield)
       else if (enemy.type === 'enforcer_heavy') {
         if (distToPlayer < 180) {
           if (enemy.state === 'idle') {
@@ -138,24 +137,21 @@ export class EnemyAISystem {
               enemy.state = 'attack';
               enemy.stateTimer = 0.8;
               const angle = Math.atan2(dy, dx);
-              enemy.vel.x = Math.cos(angle) * 4.2;
-              enemy.vel.y = Math.sin(angle) * 4.2;
+              const rushSpeed = 250; // px/sec
+              enemy.vel.x = Math.cos(angle) * rushSpeed;
+              enemy.vel.y = Math.sin(angle) * rushSpeed;
             }
           } else if (enemy.state === 'attack') {
             enemy.stateTimer -= dt;
-            if (distToPlayer < 18 && player.invulnTimer <= 0) {
-              const inc = calculateIncomingDamage(enemy.damage, player.isParrying, false, player.stats.equippedImplants);
-              if (inc.parrySuccess) {
-                events.push({ type: 'sfx', sound: 'parry' });
-                events.push({ type: 'shake', amount: 4 });
-                events.push({ type: 'floatText', x: player.pos.x, y: player.pos.y - 14, text: 'ПАРИР СТАЛІ!', color: '#38bdf8' });
+            if (distToPlayer < 18) {
+              const isParryingActive = player.isParrying && player.parryTimer > 0;
+              if (isParryingActive) {
                 enemy.state = 'stunned';
                 enemy.stateTimer = 1.5;
-              } else if (!inc.absorbed) {
-                onPlayerHit(inc.finalDamage);
-                events.push({ type: 'sfx', sound: 'player_hurt' });
-                events.push({ type: 'shake', amount: 6 });
-                events.push({ type: 'floatText', x: player.pos.x, y: player.pos.y - 12, text: `-${inc.finalDamage}`, color: '#ef4444' });
+                events.push({ type: 'sfx', sound: 'parry' });
+                applyDamageToPlayer(enemy.damage, 'СИЛОВИК');
+              } else if (player.invulnTimer <= 0) {
+                applyDamageToPlayer(enemy.damage, 'СИЛОВИК');
               }
             }
             if (enemy.stateTimer <= 0) enemy.state = 'idle';
@@ -163,7 +159,7 @@ export class EnemyAISystem {
         }
       }
 
-      // 4. Boss: Warden Mechanicus Archetype
+      // 4. Boss: Warden Mechanicus Archetype (multi-phase titan)
       else if (enemy.type === 'warden_boss') {
         if (enemy.state === 'idle') {
           enemy.stateTimer -= dt;
@@ -172,15 +168,16 @@ export class EnemyAISystem {
             const rand = Math.random();
 
             if (rand < 0.45 || isPhase2) {
-              // Circular shockwave ring
+              // Circular shockwave ring with velocities in px/sec
               events.push({ type: 'sfx', sound: 'shock' });
               events.push({ type: 'shake', amount: 5 });
               const ringRays = isPhase2 ? 10 : 8;
+              const ringSpeed = 160; // px/sec
               for (let a = 0; a < Math.PI * 2; a += (Math.PI * 2) / ringRays) {
                 projectiles.push({
                   id: Math.random(),
                   pos: { x: enemy.pos.x, y: enemy.pos.y },
-                  vel: { x: Math.cos(a) * 160 * dt, y: Math.sin(a) * 160 * dt },
+                  vel: { x: Math.cos(a) * ringSpeed, y: Math.sin(a) * ringSpeed },
                   radius: 4,
                   damage: 18,
                   element: 'electricity',
@@ -189,13 +186,14 @@ export class EnemyAISystem {
                 });
               }
             } else {
-              // Targeted laser burst
+              // Targeted laser burst with velocity in px/sec
               events.push({ type: 'sfx', sound: 'laser' });
               const angle = Math.atan2(dy, dx);
+              const bossLaserSpeed = 240; // px/sec
               projectiles.push({
                 id: Math.random(),
                 pos: { x: enemy.pos.x, y: enemy.pos.y },
-                vel: { x: Math.cos(angle) * 240 * dt, y: Math.sin(angle) * 240 * dt },
+                vel: { x: Math.cos(angle) * bossLaserSpeed, y: Math.sin(angle) * bossLaserSpeed },
                 radius: 4,
                 damage: 22,
                 element: 'electricity',

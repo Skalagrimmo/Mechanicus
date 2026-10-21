@@ -59,11 +59,11 @@ export default function App() {
           break;
         case 'particle': {
           const count = event.count || 6;
-          const speed = event.speed || 2;
+          const speed = event.speed || 150;
           const size = event.size || 2;
           for (let i = 0; i < count; i++) {
             const angle = Math.random() * Math.PI * 2;
-            const spd = (Math.random() * 0.7 + 0.3) * speed;
+            const spd = (Math.random() * 0.7 + 0.3) * (speed < 10 ? speed * 50 : speed);
             coreRef.current.particles.push({
               x: event.x,
               y: event.y,

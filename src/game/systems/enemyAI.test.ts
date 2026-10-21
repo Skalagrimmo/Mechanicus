@@ -42,6 +42,8 @@ test('drone swarmer chases player and gets stunned on parry', () => {
     comboTimer: 0,
     invulnTimer: 0,
     isParrying: true,
+    parryTimer: 0.25,
+    parryCooldown: 0,
     isDashing: false,
     dashTimer: 0
   };
@@ -54,8 +56,14 @@ test('drone swarmer chases player and gets stunned on parry', () => {
     player,
     projectiles: [],
     events,
-    onPlayerHit: () => { playerDamaged = true; },
-    onBossDefeated: () => {}
+    applyDamageToPlayer: (dmg, source, ignoreParry) => {
+      const isParryingActive = !ignoreParry && player.isParrying && player.parryTimer > 0;
+      if (isParryingActive) {
+        return true;
+      }
+      playerDamaged = true;
+      return false;
+    }
   });
 
   // Since player was parrying, damage was absorbed and drone should become stunned!
@@ -103,6 +111,8 @@ test('ranged sentry advances through windup to projectile spawn', () => {
     comboTimer: 0,
     invulnTimer: 0,
     isParrying: false,
+    parryTimer: 0,
+    parryCooldown: 0,
     isDashing: false,
     dashTimer: 0
   };
@@ -116,8 +126,7 @@ test('ranged sentry advances through windup to projectile spawn', () => {
     player,
     projectiles,
     events,
-    onPlayerHit: () => {},
-    onBossDefeated: () => {}
+    applyDamageToPlayer: () => false
   });
   assert.equal(sentry.state, 'windup');
 
@@ -127,8 +136,7 @@ test('ranged sentry advances through windup to projectile spawn', () => {
     player,
     projectiles,
     events,
-    onPlayerHit: () => {},
-    onBossDefeated: () => {}
+    applyDamageToPlayer: () => false
   });
 
   // Should have fired projectile!

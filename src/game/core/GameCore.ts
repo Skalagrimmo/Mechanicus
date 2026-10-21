@@ -20,7 +20,15 @@ import {
   SectorInfo
 } from '../types';
 import { SectorMap, generateSectorMap, checkTileCollision, TILE_SIZE, SECTORS } from '../engine/world';
-import { getNextAttackPhase, calculateIncomingDamage, calculateKnockback, WEAPONS_CATALOG, IMPLANTS_CATALOG } from '../systems/combat';
+import {
+  getNextAttackPhase,
+  calculateIncomingDamage,
+  calculateKnockback,
+  WEAPONS_CATALOG,
+  IMPLANTS_CATALOG,
+  PARRY_WINDOW_SEC,
+  PARRY_COOLDOWN_SEC
+} from '../systems/combat';
 import { getElementalDamageMultiplier } from '../systems/elemental';
 import { EnvironmentalSystem } from '../systems/environmental';
 import { EnemyAISystem } from '../systems/enemyAI';
@@ -86,6 +94,8 @@ export class GameCore {
       comboTimer: 0,
       invulnTimer: 0,
       isParrying: false,
+      parryTimer: 0,
+      parryCooldown: 0,
       isDashing: false,
       dashTimer: 0
     };
@@ -136,6 +146,16 @@ export class GameCore {
 
     this.player.pos = { ...this.map.playerSpawn };
     this.player.vel = { x: 0, y: 0 };
+
+    // Reset stuck combat states when changing sectors
+    this.player.isParrying = false;
+    this.player.parryTimer = 0;
+    this.player.parryCooldown = 0;
+    this.player.isDashing = false;
+    this.player.dashTimer = 0;
+    this.player.attackPhase = 'none';
+    this.player.attackTimer = 0;
+    this.player.invulnTimer = 0;
 
     if (sectorId === 1) {
       this.objectiveUk = 'Знайдіть термінал безпеки та відімкніть шлюз до Корозійного Реактора.';
@@ -212,6 +232,143 @@ export class GameCore {
     }
   }
 
+  /**
+   * Central authoritative damage handler for the player.
+   * Handles parry windows, implants, float text, sound effects, and reliable gameover transition.
+   */
+  public applyDamageToPlayer(
+    rawDamage: number,
+    sourceName: string,
+    ignoreParry: boolean = false,
+    element: ElementType = 'normal'
+  ): { damageDealt: number; parried: boolean; died: boolean } {
+    if (this.player.invulnTimer > 0 && !ignoreParry) {
+      return { damageDealt: 0, parried: false, died: false };
+    }
+
+    const isParryingActive = !ignoreParry && this.player.isParrying && this.player.parryTimer > 0;
+    const incoming = calculateIncomingDamage(
+      rawDamage,
+      isParryingActive,
+      false,
+      this.player.stats.equippedImplants
+    );
+
+    if (incoming.parrySuccess) {
+      this.emit({ type: 'sfx', sound: 'parry' });
+      this.emit({ type: 'shake', amount: 3 });
+      this.emit({
+        type: 'floatText',
+        x: this.player.pos.x,
+        y: this.player.pos.y - 12,
+        text: 'ПАРИРОВАНО!',
+        color: '#38bdf8'
+      });
+      if (this.player.stats.equippedImplants.includes('kinetic_dynamo')) {
+        this.player.stats.stamina = Math.min(this.player.stats.maxStamina, this.player.stats.stamina + 15);
+      }
+      return { damageDealt: 0, parried: true, died: false };
+    }
+
+    if (incoming.absorbed) {
+      return { damageDealt: 0, parried: false, died: false };
+    }
+
+    const finalDmg = incoming.finalDamage;
+    this.player.stats.hp = Math.max(0, this.player.stats.hp - finalDmg);
+    this.player.invulnTimer = 0.4;
+    this.emit({ type: 'sfx', sound: 'player_hurt' });
+    this.emit({
+      type: 'floatText',
+      x: this.player.pos.x,
+      y: this.player.pos.y - 12,
+      text: `-${finalDmg} ${sourceName}`,
+      color: '#ef4444'
+    });
+
+    let died = false;
+    if (this.player.stats.hp <= 0) {
+      died = true;
+      this.player.isParrying = false;
+      this.player.parryTimer = 0;
+      this.player.isDashing = false;
+      this.gameState = 'gameover';
+      this.emit({ type: 'stateChange', newState: 'gameover' });
+    }
+
+    return { damageDealt: finalDmg, parried: false, died };
+  }
+
+  /**
+   * Central authoritative damage handler for enemies.
+   * Ensures dead enemies stop attacking, transitions to 'ko', and awards scrap and kill counters exactly once.
+   */
+  public applyDamageToEnemy(
+    enemy: EnemyEntity,
+    rawDamage: number,
+    sourceElement: ElementType = 'normal',
+    knockbackImpulse: number = 0,
+    sourcePos?: Vector2D
+  ): { damageDealt: number; killed: boolean } {
+    // A dead enemy cannot take damage or award duplicate rewards!
+    if (enemy.state === 'ko') {
+      return { damageDealt: 0, killed: false };
+    }
+
+    const mult = getElementalDamageMultiplier(sourceElement, enemy.elementalStatus?.type);
+    const finalDmg = Math.max(1, Math.round(rawDamage * mult));
+    enemy.hp = Math.max(0, enemy.hp - finalDmg);
+    enemy.invulnTimer = 0.12;
+
+    if (knockbackImpulse > 0 && sourcePos) {
+      const kb = calculateKnockback(sourcePos.x, sourcePos.y, enemy.pos.x, enemy.pos.y, knockbackImpulse);
+      enemy.vel.x = kb.vx;
+      enemy.vel.y = kb.vy;
+    }
+
+    if (enemy.hp <= 0) {
+      enemy.state = 'ko';
+      enemy.hp = 0;
+      enemy.vel.x = 0;
+      enemy.vel.y = 0;
+
+      // Granted EXACTLY ONCE
+      this.runStats.enemiesKilled++;
+      const rewardScrap = enemy.type === 'warden_boss' ? 100 : (enemy.type === 'enforcer_heavy' ? 40 : 20);
+      this.player.stats.scrap += rewardScrap;
+      this.runStats.scrapCollected += rewardScrap;
+
+      this.emit({ type: 'sfx', sound: enemy.type === 'warden_boss' ? 'boss_roar' : 'pickup' });
+      this.emit({
+        type: 'particle',
+        x: enemy.pos.x,
+        y: enemy.pos.y,
+        color: '#f59e0b',
+        count: 16,
+        speed: 180
+      });
+      this.emit({
+        type: 'floatText',
+        x: enemy.pos.x,
+        y: enemy.pos.y - 14,
+        text: enemy.type === 'warden_boss' ? 'АРХІТЕКТОРА ЗНИЩЕНО!' : 'НЕЙТРАЛІЗОВАНО!',
+        color: '#10b981'
+      });
+
+      if (enemy.type === 'warden_boss') {
+        this.emit({ type: 'shake', amount: 10 });
+        setTimeout(() => {
+          this.gameState = 'victory';
+          this.emit({ type: 'stateChange', newState: 'victory' });
+        }, 1200);
+      }
+
+      return { damageDealt: finalDmg, killed: true };
+    }
+
+    return { damageDealt: finalDmg, killed: false };
+  }
+
   public executeAction(action: PlayerActionCommand): void {
     if (this.gameState !== 'playing') return;
 
@@ -275,8 +432,11 @@ export class GameCore {
     }
 
     if (action === 'parry') {
+      if (this.player.parryCooldown > 0) return;
       this.player.isParrying = true;
-      this.player.attackTimer = 0.35;
+      this.player.parryTimer = PARRY_WINDOW_SEC;
+      this.player.parryCooldown = PARRY_COOLDOWN_SEC;
+      this.player.attackTimer = PARRY_WINDOW_SEC;
       this.emit({ type: 'sfx', sound: 'swing' });
       return;
     }
@@ -290,7 +450,7 @@ export class GameCore {
         y: this.player.pos.y,
         color: '#38bdf8',
         count: 22,
-        speed: 5
+        speed: 180
       });
       this.emit({
         type: 'floatText',
@@ -305,17 +465,18 @@ export class GameCore {
         if (enemy.state === 'ko') continue;
         const dist = Math.hypot(enemy.pos.x - this.player.pos.x, enemy.pos.y - this.player.pos.y);
         if (dist <= empRadius) {
-          enemy.hp -= 35;
-          enemy.state = 'stunned';
-          enemy.stateTimer = 2.0;
-          enemy.invulnTimer = 0.15;
-          this.emit({
-            type: 'floatText',
-            x: enemy.pos.x,
-            y: enemy.pos.y - 10,
-            text: 'СТУН!',
-            color: '#fef08a'
-          });
+          this.applyDamageToEnemy(enemy, 35, 'electricity', 120, this.player.pos);
+          if (enemy.state !== 'ko') {
+            enemy.state = 'stunned';
+            enemy.stateTimer = 2.0;
+            this.emit({
+              type: 'floatText',
+              x: enemy.pos.x,
+              y: enemy.pos.y - 10,
+              text: 'СТУН!',
+              color: '#fef08a'
+            });
+          }
         }
       }
       return;
@@ -438,78 +599,38 @@ export class GameCore {
       const dist = Math.hypot(enemy.pos.x - hx, enemy.pos.y - hy);
       if (dist <= hitRadius + 8) {
         hitCount++;
-
-        // Elemental multiplier (e.g. frozen enemies take 1.8x from heavy impact)
-        const mult = getElementalDamageMultiplier(weapon.element, enemy.elementalStatus?.type);
-        const finalDmg = Math.round(baseDamage * mult);
-        enemy.hp -= finalDmg;
-        enemy.invulnTimer = 0.12;
-
-        // Knockback velocity based on pixels/sec
-        const kb = calculateKnockback(this.player.pos.x, this.player.pos.y, enemy.pos.x, enemy.pos.y, action === 'heavy' ? 4.5 : 2.5);
-        enemy.vel.x = kb.vx;
-        enemy.vel.y = kb.vy;
+        const kbImpulse = action === 'heavy' ? 280 : 160;
+        const { damageDealt, killed } = this.applyDamageToEnemy(
+          enemy,
+          baseDamage,
+          weapon.element,
+          kbImpulse,
+          this.player.pos
+        );
 
         if (action === 'heavy') {
           this.emit({ type: 'hitstop', duration: 0.06 });
           this.emit({ type: 'shake', amount: 4 });
           this.emit({ type: 'sfx', sound: 'heavy_hit' });
-          this.emit({
-            type: 'floatText',
-            x: enemy.pos.x,
-            y: enemy.pos.y - 12,
-            text: `-${finalDmg} КРИТ!`,
-            color: '#f59e0b'
-          });
+          if (!killed) {
+            this.emit({
+              type: 'floatText',
+              x: enemy.pos.x,
+              y: enemy.pos.y - 12,
+              text: `-${damageDealt} КРИТ!`,
+              color: '#f59e0b'
+            });
+          }
         } else {
           this.emit({ type: 'sfx', sound: 'heavy_hit' });
-          this.emit({
-            type: 'floatText',
-            x: enemy.pos.x,
-            y: enemy.pos.y - 12,
-            text: `-${finalDmg}`,
-            color: '#f8fafc'
-          });
-        }
-
-        this.emit({
-          type: 'particle',
-          x: enemy.pos.x,
-          y: enemy.pos.y,
-          color: '#ef4444',
-          count: 8,
-          speed: 2.5
-        });
-
-        if (enemy.hp <= 0) {
-          enemy.state = 'ko';
-          this.runStats.enemiesKilled++;
-          this.player.stats.scrap += 20;
-          this.runStats.scrapCollected += 20;
-          this.emit({ type: 'sfx', sound: 'pickup' });
-          this.emit({
-            type: 'particle',
-            x: enemy.pos.x,
-            y: enemy.pos.y,
-            color: '#f59e0b',
-            count: 16,
-            speed: 4
-          });
-          this.emit({
-            type: 'floatText',
-            x: enemy.pos.x,
-            y: enemy.pos.y - 16,
-            text: 'НЕЙТРАЛІЗОВАНО!',
-            color: '#10b981'
-          });
-
-          if (enemy.type === 'warden_boss') {
-            this.emit({ type: 'sfx', sound: 'boss_roar' });
-            this.emit({ type: 'shake', amount: 10 });
-            setTimeout(() => {
-              this.gameState = 'victory';
-              this.emit({ type: 'stateChange', newState: 'victory' });
-            }, 1200);
+          if (!killed) {
+            this.emit({
+              type: 'floatText',
+              x: enemy.pos.x,
+              y: enemy.pos.y - 12,
+              text: `-${damageDealt}`,
+              color: '#f8fafc'
+            });
           }
         }
       }
@@ -617,6 +738,19 @@ export class GameCore {
     if (this.player.attackTimer > 0) this.player.attackTimer -= dt;
     else this.player.attackPhase = 'none';
 
+    // Parry active window and cooldown lifecycle
+    if (this.player.parryCooldown > 0) {
+      this.player.parryCooldown = Math.max(0, this.player.parryCooldown - dt);
+    }
+    if (this.player.parryTimer > 0) {
+      this.player.parryTimer = Math.max(0, this.player.parryTimer - dt);
+      if (this.player.parryTimer <= 0) {
+        this.player.isParrying = false;
+      }
+    } else {
+      this.player.isParrying = false;
+    }
+
     if (this.player.comboTimer > 0) {
       this.player.comboTimer -= dt;
     } else {
@@ -629,21 +763,7 @@ export class GameCore {
     if (tileX >= 0 && tileX < this.map.widthInTiles && tileY >= 0 && tileY < this.map.heightInTiles) {
       const currentTile = this.map.tiles[tileY][tileX];
       if (currentTile === 'hazard_acid' && this.player.invulnTimer <= 0) {
-        const incoming = calculateIncomingDamage(8, false, false, this.player.stats.equippedImplants);
-        this.player.stats.hp -= incoming.finalDamage;
-        this.player.invulnTimer = 0.5;
-        this.emit({ type: 'sfx', sound: 'player_hurt' });
-        this.emit({
-          type: 'floatText',
-          x: this.player.pos.x,
-          y: this.player.pos.y - 10,
-          text: `-${incoming.finalDamage} КИСЛОТА`,
-          color: '#22c55e'
-        });
-        if (this.player.stats.hp <= 0) {
-          this.gameState = 'gameover';
-          this.emit({ type: 'stateChange', newState: 'gameover' });
-        }
+        this.applyDamageToPlayer(8, 'КИСЛОТА', true, 'acid');
       }
     }
 
@@ -661,7 +781,7 @@ export class GameCore {
             y: prop.pos.y + 8,
             color: '#f59e0b',
             count: 28,
-            speed: 5
+            speed: 200
           });
 
           const events: GameEvent[] = [];
@@ -673,28 +793,15 @@ export class GameCore {
             this.map,
             this.props,
             this.enemies,
-            events
+            events,
+            (enemy, dmg, elem) => this.applyDamageToEnemy(enemy, dmg, elem, 220, prop.pos)
           );
           for (const ev of events) this.emit(ev);
 
           // Direct explosion blast to player
           const playerDist = Math.hypot(this.player.pos.x - (prop.pos.x + 8), this.player.pos.y - (prop.pos.y + 8));
           if (playerDist <= 48 && this.player.invulnTimer <= 0) {
-            const inc = calculateIncomingDamage(30, false, false, this.player.stats.equippedImplants);
-            this.player.stats.hp -= inc.finalDamage;
-            this.player.invulnTimer = 0.6;
-            this.emit({ type: 'sfx', sound: 'player_hurt' });
-            this.emit({
-              type: 'floatText',
-              x: this.player.pos.x,
-              y: this.player.pos.y - 12,
-              text: `-${inc.finalDamage} ВИБУХ`,
-              color: '#ef4444'
-            });
-            if (this.player.stats.hp <= 0) {
-              this.gameState = 'gameover';
-              this.emit({ type: 'stateChange', newState: 'gameover' });
-            }
+            this.applyDamageToPlayer(30, 'ВИБУХ', false, 'fire');
           }
         }
       }
@@ -707,67 +814,57 @@ export class GameCore {
       player: this.player,
       projectiles: this.projectiles,
       events: enemyEvents,
-      onPlayerHit: (dmg) => {
-        this.player.stats.hp -= dmg;
-        this.player.invulnTimer = 0.45;
-        if (this.player.stats.hp <= 0) {
-          this.gameState = 'gameover';
-          this.emit({ type: 'stateChange', newState: 'gameover' });
-        }
-      },
-      onBossDefeated: () => {
-        this.gameState = 'victory';
-        this.emit({ type: 'stateChange', newState: 'victory' });
+      applyDamageToPlayer: (dmg, source, ignoreParry) => {
+        const res = this.applyDamageToPlayer(dmg, source, ignoreParry);
+        return res.parried;
       }
     });
     for (const ev of enemyEvents) this.emit(ev);
 
     // 4. Update Environmental hazards (periodic damage/status ticks)
     const hazardEvents: GameEvent[] = [];
-    this.environmentalSystem.update(dt, this.player, this.enemies, hazardEvents);
+    this.environmentalSystem.update(
+      dt,
+      this.player,
+      this.enemies,
+      hazardEvents,
+      (dmg, sourceName, elem) => this.applyDamageToPlayer(dmg, sourceName, false, elem),
+      (enemy, dmg, elem) => this.applyDamageToEnemy(enemy, dmg, elem)
+    );
     for (const ev of hazardEvents) this.emit(ev);
 
     // 5. Update Projectiles
     for (let i = this.projectiles.length - 1; i >= 0; i--) {
       const p = this.projectiles[i];
-      p.pos.x += p.vel.x;
-      p.pos.y += p.vel.y;
+      // Movement integration: velocity in px/sec multiplied by dt
+      p.pos.x += p.vel.x * dt;
+      p.pos.y += p.vel.y * dt;
       p.duration -= dt;
 
       if (p.owner === 'enemy') {
         const dist = Math.hypot(p.pos.x - this.player.pos.x, p.pos.y - this.player.pos.y);
         if (dist < 10 && this.player.invulnTimer <= 0) {
-          const inc = calculateIncomingDamage(p.damage, this.player.isParrying, false, this.player.stats.equippedImplants);
-          if (inc.parrySuccess) {
-            this.emit({ type: 'sfx', sound: 'parry' });
+          const res = this.applyDamageToPlayer(p.damage, 'ЛАЗЕР', false, p.element);
+          if (res.parried) {
             p.owner = 'player';
             p.vel.x *= -1.5;
             p.vel.y *= -1.5;
-            this.emit({
-              type: 'floatText',
-              x: this.player.pos.x,
-              y: this.player.pos.y - 12,
-              text: 'ВІДБИТО!',
-              color: '#38bdf8'
-            });
+            p.duration = 2.0;
             continue;
-          } else if (!inc.absorbed) {
-            this.player.stats.hp -= inc.finalDamage;
-            this.player.invulnTimer = 0.4;
-            this.emit({ type: 'sfx', sound: 'player_hurt' });
-            this.emit({
-              type: 'floatText',
-              x: this.player.pos.x,
-              y: this.player.pos.y - 12,
-              text: `-${inc.finalDamage}`,
-              color: '#ef4444'
-            });
+          } else {
             this.projectiles.splice(i, 1);
-            if (this.player.stats.hp <= 0) {
-              this.gameState = 'gameover';
-              this.emit({ type: 'stateChange', newState: 'gameover' });
-            }
             continue;
+          }
+        }
+      } else if (p.owner === 'player') {
+        for (const enemy of this.enemies) {
+          if (enemy.state === 'ko') continue;
+          const dist = Math.hypot(p.pos.x - enemy.pos.x, p.pos.y - enemy.pos.y);
+          if (dist < 12 + p.radius && enemy.invulnTimer <= 0) {
+            this.applyDamageToEnemy(enemy, p.damage, p.element, 180, p.pos);
+            this.emit({ type: 'sfx', sound: 'heavy_hit' });
+            this.projectiles.splice(i, 1);
+            break;
           }
         }
       }
@@ -780,8 +877,8 @@ export class GameCore {
     // 6. Update Particles
     for (let i = this.particles.length - 1; i >= 0; i--) {
       const part = this.particles[i];
-      part.x += part.vx;
-      part.y += part.vy;
+      part.x += part.vx * dt;
+      part.y += part.vy * dt;
       part.life -= dt;
       if (part.life <= 0) {
         this.particles.splice(i, 1);

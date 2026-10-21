@@ -75,6 +75,8 @@ export interface PlayerEntity {
   comboTimer: number;
   invulnTimer: number;
   isParrying: boolean;
+  parryTimer: number;
+  parryCooldown: number;
   isDashing: boolean;
   dashTimer: number;
   elementalStatus?: {

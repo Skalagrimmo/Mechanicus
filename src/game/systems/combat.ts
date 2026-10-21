@@ -73,6 +73,9 @@ export const IMPLANTS_CATALOG: Record<string, ImplantData> = {
   }
 };
 
+export const PARRY_WINDOW_SEC = 0.25; // 250ms active parry window
+export const PARRY_COOLDOWN_SEC = 0.40; // 400ms recovery cooldown before next parry
+
 /**
  * Evaluates the next attack phase based on input and combo timing
  */
